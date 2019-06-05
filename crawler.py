@@ -7,11 +7,6 @@ from bcdbr.util.hashutil import keccak256
 
 import logging
 
-# some logging setup
-FORMAT = '%{asctime}-15s %{message}s'
-logging.basicConfig(format=FORMAT)
-log = logging.getLogger('crawler')
-
 START = 4357444
 FINISH = 7854631
 BALANCE_DIR = 'output'
@@ -19,11 +14,13 @@ GETH_DB_PATH = "/home/yao/Ethereum/geth-linux-amd64-1.8.27-4bcc0a37/geth-storage
 
 TRANSFER_EVENT = b"Transfer(address,address,uint256)"
 TRANSFER_EVENT_HASH = keccak256(TRANSFER_EVENT)
-BURN_EVENT = b"Burn(address,address,uint256)"
+BURN_EVENT = b"Burn(address,bytes32,uint256)"
 BURN_EVENT_HASH = keccak256(BURN_EVENT)
+print(BURN_EVENT_HASH.hex())
 CONTRACT_ADDR = bytes.fromhex("4CEdA7906a5Ed2179785Cd3A40A69ee8bc99C466")
 LEDGER_ADDR = bytes.fromhex("D180443cFB5015088fCC6689c9D66660FC20155c")
 MINTING_ADDR = bytes.fromhex("50b26685bc788e164d940f0a73770f4b9196b052")
+ZERO_ADDR = bytes.fromhex("0000000000000000000000000000000000000000")
 MULTIMINT_METHOD_ID = bytes.fromhex("88df13fa")
 
 db = gethdb.create_db(GETH_DB_PATH)
@@ -31,7 +28,7 @@ db = gethdb.create_db(GETH_DB_PATH)
 def format_input(l):
     return (l.topics[1][12:], l.topics[2][12:], int.from_bytes(l.data, 'big'))
 
-def execute_transfer(state, _from, to, amount, is_mint, txhash):
+def execute_transfer(state, _from, to, amount, type, txhash):
     from_balance = 0
     to_balance = 0
 
@@ -43,12 +40,12 @@ def execute_transfer(state, _from, to, amount, is_mint, txhash):
             to_balance = state[to]
 
         state[to] = to_balance + amount
-        if not is_mint:
+        if not (type == "mint"):
             state[_from] = from_balance - amount
 
     # check invariant should always be true
-    print("(%s) %s[%s] -> %s[%s] amount: %s mint: %s" %
-        (txhash.hex(), _from.hex(), from_balance, to.hex(), to_balance, amount, is_mint))
+    print("(%s) %s[%s] -> %s[%s] amount: %s type: %s" %
+        (txhash.hex(), _from.hex(), from_balance, to.hex(), to_balance, amount, type))
     if _from in state:
         assert state[_from] >= 0
     return state
@@ -72,9 +69,15 @@ def loop(database, i, state):
                 continue
 
             if not is_mint:
-                if l.topics[0] == TRANSFER_EVENT_HASH or l.topics[0] == BURN_EVENT_HASH:
+                if l.topics[0] == TRANSFER_EVENT_HASH:
                     f = format_input(l)
-                    state = execute_transfer(state, f[0], f[1], f[2], False, rec.txhash)
+                    state = execute_transfer(state, f[0], f[1], f[2], "transfer", rec.txhash)
+                    continue
+
+                if l.topics[0] == BURN_EVENT_HASH:
+                    f = format_input(l)
+                    state = execute_transfer(state, f[0], ZERO_ADDR, f[2], "burn", rec.txhash)
+
             else:
                 # heuristic: the mint function only ever calls the contract
                 # we assume that if the transaction directly calls the contract
@@ -82,7 +85,8 @@ def loop(database, i, state):
                 # be a mint... (any counterexamples to this?)
                 if (l.topics[0] == TRANSFER_EVENT_HASH):
                     f = format_input(l)
-                    state = execute_transfer(state, f[0], f[1], f[2], True, rec.txhash)
+                    state = execute_transfer(state, f[0], f[1], f[2], "mint", rec.txhash)
+                    continue
     return state
 
 def flushfile(state, block_num):
@@ -102,4 +106,3 @@ if __name__ == "__main__":
         state = loop(db, i, state)
         if (i % 10000 == 0 or i == FINISH):
             flushfile(state, i)
-            print("block %s output", i)
