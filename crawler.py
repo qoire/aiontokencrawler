@@ -1,5 +1,6 @@
 import os
 import csv
+import sqlite3
 
 # assumes python path includes bcdbr
 from bcdbr.eth import gethdb, bloom, decoding
@@ -11,6 +12,8 @@ START = 4357444
 FINISH = 7854631
 BALANCE_DIR = 'output'
 GETH_DB_PATH = "/home/yao/Ethereum/geth-linux-amd64-1.8.27-4bcc0a37/geth-storage/geth/chaindata"
+
+OUT_DB_PATH = "balances.sqlite"
 
 TRANSFER_EVENT = b"Transfer(address,address,uint256)"
 TRANSFER_EVENT_HASH = keccak256(TRANSFER_EVENT)
@@ -44,18 +47,20 @@ def execute_transfer(state, _from, to, amount, type, txhash):
             state[_from] = from_balance - amount
 
     # check invariant should always be true
-    print("(%s) %s[%s] -> %s[%s] amount: %s type: %s" %
-        (txhash.hex(), _from.hex(), from_balance, to.hex(), to_balance, amount, type))
+    print("(%s) %s[%s] -> %s -> %s[%s] type: %s" %
+        (txhash.hex(), _from.hex(), from_balance, amount, to.hex(), to_balance, type))
     if _from in state:
         assert state[_from] >= 0
-    return state
+    return (state, (txhash, _from, from_balance, to, to_balance, amount, type))
 
 def loop(database, i, state):
     state = state
     block = gethdb.get_fullblock_from_num(database, i)
+    transfers = []
 
+    state_changed = False
     if not bloom.has_address(CONTRACT_ADDR, block.logsbloom):
-        return state
+        return (state, state_changed, transfers)
 
     # otherwise we need to check each receipt
     for tr in zip(block.transactions, block.receipts):
@@ -71,12 +76,17 @@ def loop(database, i, state):
             if not is_mint:
                 if l.topics[0] == TRANSFER_EVENT_HASH:
                     f = format_input(l)
-                    state = execute_transfer(state, f[0], f[1], f[2], "transfer", rec.txhash)
+                    (state, transfer) = execute_transfer(state, f[0], f[1], f[2], "transfer", rec.txhash)
+                    transfers.append(transfer)
+                    state_changed = True
                     continue
 
                 if l.topics[0] == BURN_EVENT_HASH:
                     f = format_input(l)
-                    state = execute_transfer(state, f[0], ZERO_ADDR, f[2], "burn", rec.txhash)
+                    (state, transfer) = execute_transfer(state, f[0], ZERO_ADDR, f[2], "burn", rec.txhash)
+                    transfers.append(transfer)
+                    state_changed = True
+                    continue
 
             else:
                 # heuristic: the mint function only ever calls the contract
@@ -85,24 +95,54 @@ def loop(database, i, state):
                 # be a mint... (any counterexamples to this?)
                 if (l.topics[0] == TRANSFER_EVENT_HASH):
                     f = format_input(l)
-                    state = execute_transfer(state, f[0], f[1], f[2], "mint", rec.txhash)
+                    (state, transfer) = execute_transfer(state, f[0], f[1], f[2], "mint", rec.txhash)
+                    transfers.append(transfer)
+                    state_changed = True
                     continue
-    return state
+    return (state, state_changed, transfers)
+
+# output database related functionality
+def setup_database():
+    # output database
+    conn = sqlite3.connect(OUT_DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("CREATE TABLE transfers (txhash text, blocknum integer, sender text, recipient text, amount text, type text)")
+        c.execute("CREATE TABLE balances (address text, balance text, blocknum integer, primary key (address, blocknum))")
+        conn.commit()
+    finally:
+        conn.close()
+
+def commit_state(state, transfers, block_num):
+    conn = sqlite3.connect(OUT_DB_PATH)
+    c = conn.cursor()
+    try:
+        cf = []
+        for (h, f, fb, t, tb, amount, tp) in transfers:
+            cf.append((h.hex(), block_num, f.hex(), t.hex(), str(amount), tp))
+        
+        bf = []
+        for k, v in state.items():
+            if v > 0:
+                bf.append((k.hex(), str(v), block_num))
+
+        c.executemany("INSERT INTO transfers values(?,?,?,?,?,?)", cf)
+        c.executemany("INSERT INTO balances values(?,?,?)", bf)
+        conn.commit()
+    finally:
+        conn.close()
 
 def flushfile(state, block_num):
-    with open("%s/%s.csv" % (BALANCE_DIR, block_num), 'w') as f:
+    with open("/media/yao/MOVIES/aion-erc20/%s.csv" % block_num, 'w') as f:
         w = csv.writer(f)
         for k, v in state.items():
-            w.writerow([k.hex(), v])
-
-# flush directories
-if os.path.exists(BALANCE_DIR):
-    os.removedirs(BALANCE_DIR)
-os.makedirs(BALANCE_DIR)
+            if (v != 0):
+                w.writerow([k.hex(), v])
 
 if __name__ == "__main__":
     state = {}
+    setup_database()
     for i in range(START, FINISH + 1):
-        state = loop(db, i, state)
-        if (i % 10000 == 0 or i == FINISH):
-            flushfile(state, i)
+        (state, state_changed, transfers) = loop(db, i, state)
+        if (state_changed):
+            commit_state(state, transfers, i)
