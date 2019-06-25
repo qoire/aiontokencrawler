@@ -11,7 +11,7 @@ import logging
 START = 4357444
 FINISH = 7854631
 BALANCE_DIR = 'output'
-GETH_DB_PATH = "/home/yao/Ethereum/geth-linux-amd64-1.8.27-4bcc0a37/geth-storage/geth/chaindata"
+GETH_DB_PATH = "/home/yao/Ethereum/geth-storage/geth/chaindata"
 
 OUT_DB_PATH = "/media/yao/STORAGE/aion-erc20/erc20-history.sqlite"
 
@@ -109,18 +109,26 @@ conn.isolation_level = None
 def setup_database():
     # output database
     c = conn.cursor()
-    try:
-        c.execute("CREATE TABLE transfers (txhash text, blocknum integer, sender text, recipient text, amount text, type text)")
-        c.execute("CREATE TABLE balances (address text, balance text, blocknum integer, primary key (address, blocknum))")
-        c.execute("PRAGMA journal_mode = MEMORY")
-        c.execute('PRAGMA synchronous=OFF')
-        conn.commit()
-    finally:
-        c.close()
+    c.execute("CREATE TABLE addresses (address text UNIQUE)")
+
+    c.execute("CREATE TABLE txtype (type text)")
+    c.execute("INSERT INTO txtype (ROWID, type) values(?, ?)", (0, "transfer"))
+    c.execute("INSERT INTO txtype (ROWID, type) values(?, ?)", (1, "mint"))
+    c.execute("INSERT INTO txtype (ROWID, type) values(?, ?)", (2, "burn"))
+    
+    c.execute("CREATE TABLE transfers (txhash text, blocknum integer, sender integer, recipient integer, amount text, type integer)")
+    c.execute("CREATE TABLE balances (address integer, balance text, blocknum integer, PRIMARY KEY (address, blocknum))")
+    
+    c.execute("PRAGMA journal_mode = MEMORY")
+    c.execute('PRAGMA synchronous=OFF')
+    conn.commit()
 
 def commit_state(state, transfers, block_num):
     cf = []
+    addr_set = set()
     for (h, f, fb, t, tb, amount, tp) in transfers:
+        addr_set.add((f.hex(), ))
+        addr_set.add((t.hex(), ))
         cf.append((h.hex(), block_num, f.hex(), t.hex(), str(amount), tp))
     
     bf = []
@@ -130,22 +138,24 @@ def commit_state(state, transfers, block_num):
 
     c = conn.cursor()
     try:
-        c.execute("BEGIN")
-        c.executemany("INSERT INTO transfers values(?,?,?,?,?,?)", cf)
-        c.executemany("INSERT INTO balances values(?,?,?)", bf)
+        c.execute("BEGIN")        
+        c.executemany("INSERT OR IGNORE INTO addresses(address) values(?)", list(addr_set))
+        
+        c.executemany("""INSERT INTO transfers values(
+            ?,?,
+            (SELECT ROWID FROM addresses WHERE address=?),
+            (SELECT ROWID FROM addresses WHERE address=?),
+            ?,
+            (SELECT ROWID FROM txtype WHERE type = ?))""", cf)
+        
+        c.executemany("""INSERT INTO balances values(
+            (SELECT ROWID FROM addresses WHERE address = ?)
+            ,?,?)""", bf)
+        
         c.execute("COMMIT")
     except e:
+        print(e)
         c.execute("ROLLBACK")
-        raise
-    finally:
-        c.close()
-
-def flushfile(state, block_num):
-    with open("/media/yao/MOVIES/aion-erc20/%s.csv" % block_num, 'w') as f:
-        w = csv.writer(f)
-        for k, v in state.items():
-            if (v != 0):
-                w.writerow([k.hex(), v])
 
 if __name__ == "__main__":
     try:
